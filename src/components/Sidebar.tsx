@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { MapPin, Navigation, Search, Menu, X, ArrowRight, Clock, Map as MapIcon } from 'lucide-react';
+import { MapPin, Navigation, Search, Menu, X, ArrowRight, Clock, Map as MapIcon, Crosshair } from 'lucide-react';
 import { fetchRoute } from '../services/routing';
 import type { RouteData, Coordinate } from '../services/routing';
 
@@ -24,19 +24,33 @@ const formatDistance = (meters: number) => {
   return `${km.toFixed(1)} km`;
 };
 
-// Geocoding using Photon API (more lenient than Nominatim)
+// Fast geocoding — race Photon AND Nominatim, first response wins
 const geocode = async (query: string): Promise<Coordinate | null> => {
   try {
-    const res = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=1`);
-    const data = await res.json();
-    if (data && data.features && data.features.length > 0) {
-      const [lng, lat] = data.features[0].geometry.coordinates;
-      return { lat, lng };
-    }
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('geocode timeout')), 3000)
+    );
+
+    const photon = fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=1`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data?.features?.length) throw new Error('empty');
+        const [lng, lat] = data.features[0].geometry.coordinates;
+        return { lat, lng } as Coordinate;
+      });
+
+    const nominatim = fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data?.length) throw new Error('empty');
+        return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) } as Coordinate;
+      });
+
+    return await Promise.any([photon, nominatim, timeout]) as Coordinate;
   } catch (e) {
-    console.error(e);
+    console.error('Geocode failed:', e);
+    return null;
   }
-  return null;
 };
 
 function useDebounce<T>(value: T, delay: number): T {
@@ -152,7 +166,7 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
   };
 
   return (
-    <div className="relative z-10 flex items-center gap-3 group">
+    <div className={`relative flex items-center gap-3 group ${isOpen ? 'z-50' : 'z-10'}`}>
       <div className={`w-8 h-8 rounded-full bg-black/40 border border-white/10 flex items-center justify-center flex-shrink-0 transition-colors ${iconBgHover}`}>
         {icon}
       </div>
@@ -165,26 +179,30 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
              onChange(e.target.value);
           }}
           onFocus={() => suggestions.length > 0 && !justSelected.current && setIsOpen(true)}
-          onBlur={() => setTimeout(() => setIsOpen(false), 150)}
+          onBlur={() => setTimeout(() => setIsOpen(false), 200)}
           placeholder={placeholder} 
           className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500/50 focus:bg-black/40 transition-all text-white placeholder-gray-500"
         />
         <AnimatePresence>
           {isOpen && suggestions.length > 0 && (
             <motion.div 
-              initial={{ opacity: 0, y: -10 }}
+              initial={{ opacity: 0, y: -5 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="absolute top-full left-0 right-0 mt-2 bg-gray-900 border border-white/10 rounded-xl overflow-hidden shadow-xl z-50 text-sm"
+              exit={{ opacity: 0, y: -5 }}
+              transition={{ duration: 0.12 }}
+              className="absolute top-full left-0 right-0 mt-1 bg-gray-900/95 backdrop-blur-sm border border-white/10 rounded-xl overflow-hidden shadow-2xl shadow-black/50 z-[100] text-sm"
             >
               {suggestions.map((s, i) => (
                 <div 
                   key={i} 
-                  className="px-4 py-3 hover:bg-white/10 cursor-pointer text-gray-300 hover:text-white transition-colors border-b border-white/5 last:border-0"
-                  onClick={() => handleSelect(s)}
+                  className="px-4 py-2.5 hover:bg-indigo-500/20 cursor-pointer text-gray-300 hover:text-white transition-colors border-b border-white/5 last:border-0"
+                  onMouseDown={(e) => {
+                    e.preventDefault(); // Prevent blur from firing
+                    handleSelect(s);
+                  }}
                 >
-                  <div className="font-medium text-white">{s.name}</div>
-                  <div className="text-xs text-gray-400">
+                  <div className="font-medium text-white text-sm">{s.name}</div>
+                  <div className="text-xs text-gray-500 truncate">
                     {[s.street, s.city, s.state, s.country].filter(Boolean).join(', ')}
                   </div>
                 </div>
@@ -202,6 +220,23 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated 
   const [endQuery, setEndQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [routeInfo, setRouteInfo] = useState<{distance: number, duration: number, algorithm: string} | null>(null);
+  const [startCoordOverride, setStartCoordOverride] = useState<Coordinate | null>(null);
+
+  const handleUseMyLocation = () => {
+    if (!navigator.geolocation) {
+      alert('Geolocation is not supported by your browser.');
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const coord = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setStartCoordOverride(coord);
+        setStartQuery(`📍 My Location (${coord.lat.toFixed(4)}, ${coord.lng.toFixed(4)})`);
+      },
+      () => alert('Unable to get your location. Please allow location access.'),
+      { enableHighAccuracy: true, timeout: 5000 }
+    );
+  };
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -211,8 +246,11 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated 
     setRouteInfo(null);
     onRouteCalculated(null);
 
-    const startCoord = await geocode(startQuery);
-    const endCoord = await geocode(endQuery);
+    // Run both geocodes in PARALLEL, use coordinate override if GPS was used
+    const [startCoord, endCoord] = await Promise.all([
+      startCoordOverride ? Promise.resolve(startCoordOverride) : geocode(startQuery),
+      geocode(endQuery)
+    ]);
 
     if (startCoord && endCoord) {
       const route = await fetchRoute(startCoord, endCoord);
@@ -279,11 +317,23 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated 
 
                   <AddressAutocomplete
                     value={startQuery}
-                    onChange={setStartQuery}
+                    onChange={(v) => { setStartQuery(v); setStartCoordOverride(null); }}
                     placeholder="Start point"
                     icon={<div className="w-2.5 h-2.5 rounded-full bg-indigo-500"></div>}
                     iconBgHover="group-hover:border-indigo-500/50"
                   />
+
+                  {/* Use My Location Button */}
+                  <div className="relative z-10 pl-11">
+                    <button
+                      type="button"
+                      onClick={handleUseMyLocation}
+                      className="flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors py-1"
+                    >
+                      <Crosshair className="w-3 h-3" />
+                      Use my current location
+                    </button>
+                  </div>
 
                   <AddressAutocomplete
                     value={endQuery}
