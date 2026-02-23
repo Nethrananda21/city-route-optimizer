@@ -22,7 +22,7 @@ export interface RouteData {
  * Sub-second response for any distance worldwide.
  */
 export async function fetchRoute(start: Coordinate, end: Coordinate): Promise<RouteData | null> {
-  const url = `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&steps=true`;
+  const url = `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&steps=true&exclude=ferry`;
 
   try {
     console.log('Fetching route from OSRM...');

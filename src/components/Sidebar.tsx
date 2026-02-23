@@ -260,7 +260,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated,
         onRouteCalculated(route);
         setRouteInfo({ distance: route.distance, duration: route.duration, algorithm: route.algorithm });
       } else {
-        alert('Could not find a route between these locations.');
+        alert('No drivable route found. These locations may be separated by an ocean or not connected by roads.');
       }
     } else {
       alert('Could not locate one of the addresses.');
