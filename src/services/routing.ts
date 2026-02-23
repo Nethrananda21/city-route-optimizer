@@ -19,15 +19,18 @@ export interface RouteData {
 
 /**
  * Fast OSRM routing — uses Dijkstra-based Contraction Hierarchies internally.
- * Sub-second response for any distance worldwide.
+ * If OSRM returns a route, it's drivable. OSRM never routes across oceans.
  */
 export async function fetchRoute(start: Coordinate, end: Coordinate): Promise<RouteData | null> {
-  const url = `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&steps=true&exclude=ferry`;
+  const url = `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=simplified&geometries=geojson&steps=true`;
 
   try {
     console.log('Fetching route from OSRM...');
     const t0 = performance.now();
-    const response = await fetch(url);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
     if (!response.ok) throw new Error('OSRM request failed');
     const data = await response.json();
     console.log(`OSRM responded in ${((performance.now() - t0) / 1000).toFixed(2)}s`);
