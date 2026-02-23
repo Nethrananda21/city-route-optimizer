@@ -8,6 +8,7 @@ interface SidebarProps {
   isOpen: boolean;
   setIsOpen: (isOpen: boolean) => void;
   onRouteCalculated: (data: RouteData | null) => void;
+  onUserLocation: (coord: Coordinate | null) => void;
 }
 
 // Helper to format duration
@@ -215,7 +216,7 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
   );
 };
 
-const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated }) => {
+const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated, onUserLocation }) => {
   const [startQuery, setStartQuery] = useState('');
   const [endQuery, setEndQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -231,6 +232,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated 
       (pos) => {
         const coord = { lat: pos.coords.latitude, lng: pos.coords.longitude };
         setStartCoordOverride(coord);
+        onUserLocation(coord);
         setStartQuery(`📍 My Location (${coord.lat.toFixed(4)}, ${coord.lng.toFixed(4)})`);
       },
       () => alert('Unable to get your location. Please allow location access.'),

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { MapContainer, TileLayer, Polyline, Marker, Popup, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Polyline, Marker, Popup, useMap, CircleMarker } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
-import type { RouteData } from '../services/routing';
+import type { RouteData, Coordinate } from '../services/routing';
 import L from 'leaflet';
 
 // Fix Leaflet's default icon path issues
@@ -32,6 +32,7 @@ const neonIcon = L.divIcon({
 
 interface MapAreaProps {
   routeData: RouteData | null;
+  userLocation: Coordinate | null;
 }
 
 // Component to dynamically fit bounds when route changes
@@ -41,7 +42,6 @@ const RouteBounds = ({ route }: { route: RouteData | null }) => {
   useEffect(() => {
     if (route && route.geometry && route.geometry.length > 0) {
       const bounds = L.latLngBounds(route.geometry);
-      // Pad bounds to accommodate sidebar on the right/left
       map.fitBounds(bounds, { padding: [50, 50], animate: true, duration: 1.5 });
     }
   }, [route, map]);
@@ -49,24 +49,51 @@ const RouteBounds = ({ route }: { route: RouteData | null }) => {
   return null;
 };
 
-const MapArea: React.FC<MapAreaProps> = ({ routeData }) => {
-  // Default center (e.g., New York City)
-  const [center] = useState<[number, number]>([40.7128, -74.0060]);
+// Fly to user location when it changes
+const FlyToLocation = ({ location }: { location: Coordinate | null }) => {
+  const map = useMap();
+  useEffect(() => {
+    if (location) {
+      map.flyTo([location.lat, location.lng], 15, { duration: 1.5 });
+    }
+  }, [location, map]);
+  return null;
+};
+
+const MapArea: React.FC<MapAreaProps> = ({ routeData, userLocation }) => {
+  const [center] = useState<[number, number]>([20.5937, 78.9629]); // India
 
   return (
     <MapContainer 
       center={center} 
-      zoom={13} 
+      zoom={5} 
       className="w-full h-full"
-      zoomControl={false} // We will use custom zoom control styling
+      zoomControl={false}
     >
-      {/* Dark Matter tiles for stunning dark mode aesthetics */}
       <TileLayer
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
         url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
       />
+
+      {/* User location marker */}
+      {userLocation && (
+        <>
+          <CircleMarker
+            center={[userLocation.lat, userLocation.lng]}
+            radius={20}
+            pathOptions={{ color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.15, weight: 1 }}
+          />
+          <CircleMarker
+            center={[userLocation.lat, userLocation.lng]}
+            radius={8}
+            pathOptions={{ color: '#ffffff', fillColor: '#3b82f6', fillOpacity: 1, weight: 3 }}
+          >
+            <Popup>📍 You are here</Popup>
+          </CircleMarker>
+          <FlyToLocation location={userLocation} />
+        </>
+      )}
       
-      {/* Dynamic route line with a neon gradient look using Leaflet styles */}
       {routeData && routeData.geometry && (
         <>
           <Polyline 
@@ -85,7 +112,6 @@ const MapArea: React.FC<MapAreaProps> = ({ routeData }) => {
             lineCap="round"
             lineJoin="round"
           />
-          {/* Start and End Markers */}
           <Marker position={routeData.geometry[0]} icon={neonIcon}>
             <Popup className="glass-popup">Start</Popup>
           </Marker>
