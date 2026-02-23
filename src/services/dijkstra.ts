@@ -1,189 +1,227 @@
 import type { Coordinate } from './routing';
 
-interface OsmWay {
-  id: number;
-  nodes: number[];
-  tags: Record<string, string>;
-}
+// ============================================================
+// HAVERSINE DISTANCE (meters)
+// ============================================================
+const DEG_TO_RAD = Math.PI / 180;
 
-// Distance between two coordinates in meters (Haversine formula)
 export function haversineDistance(c1: Coordinate, c2: Coordinate): number {
-  const R = 6371e3; // Earth radius in meters
-  const toRad = (val: number) => val * Math.PI / 180;
-  
-  const dLat = toRad(c2.lat - c1.lat);
-  const dLon = toRad(c2.lng - c1.lng);
-  
-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-            Math.cos(toRad(c1.lat)) * Math.cos(toRad(c2.lat)) *
-            Math.sin(dLon / 2) * Math.sin(dLon / 2);
-            
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
+  const R = 6371e3;
+  const dLat = (c2.lat - c1.lat) * DEG_TO_RAD;
+  const dLon = (c2.lng - c1.lng) * DEG_TO_RAD;
+  const a =
+    Math.sin(dLat * 0.5) * Math.sin(dLat * 0.5) +
+    Math.cos(c1.lat * DEG_TO_RAD) * Math.cos(c2.lat * DEG_TO_RAD) *
+    Math.sin(dLon * 0.5) * Math.sin(dLon * 0.5);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-class MinPriorityQueue {
-  private elements: { id: number, priority: number }[] = [];
+// Fast approximation for heuristic (no trig, ~0.5% error at city scale)
+function fastApproxDistance(c1: Coordinate, c2: Coordinate): number {
+  const latMid = (c1.lat + c2.lat) * 0.5 * DEG_TO_RAD;
+  const dx = (c2.lng - c1.lng) * DEG_TO_RAD * Math.cos(latMid) * 6371e3;
+  const dy = (c2.lat - c1.lat) * DEG_TO_RAD * 6371e3;
+  return Math.sqrt(dx * dx + dy * dy);
+}
 
-  enqueue(id: number, priority: number) {
-    this.elements.push({ id, priority });
-    this.elements.sort((a, b) => a.priority - b.priority);
+// ============================================================
+// BINARY MIN-HEAP (O(log n) insert/extract)
+// ============================================================
+class BinaryMinHeap {
+  private heap: { id: number; f: number }[] = [];
+
+  get size() { return this.heap.length; }
+
+  push(id: number, f: number) {
+    this.heap.push({ id, f });
+    this._bubbleUp(this.heap.length - 1);
   }
 
-  dequeue() {
-    return this.elements.shift();
+  pop(): { id: number; f: number } | undefined {
+    if (this.heap.length === 0) return undefined;
+    const top = this.heap[0];
+    const last = this.heap.pop()!;
+    if (this.heap.length > 0) {
+      this.heap[0] = last;
+      this._sinkDown(0);
+    }
+    return top;
   }
 
-  isEmpty() {
-    return this.elements.length === 0;
+  private _bubbleUp(i: number) {
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (this.heap[i].f >= this.heap[parent].f) break;
+      [this.heap[i], this.heap[parent]] = [this.heap[parent], this.heap[i]];
+      i = parent;
+    }
+  }
+
+  private _sinkDown(i: number) {
+    const n = this.heap.length;
+    while (true) {
+      let smallest = i;
+      const l = 2 * i + 1;
+      const r = 2 * i + 2;
+      if (l < n && this.heap[l].f < this.heap[smallest].f) smallest = l;
+      if (r < n && this.heap[r].f < this.heap[smallest].f) smallest = r;
+      if (smallest === i) break;
+      [this.heap[i], this.heap[smallest]] = [this.heap[smallest], this.heap[i]];
+      i = smallest;
+    }
   }
 }
 
-export async function computeDijkstraRoute(start: Coordinate, end: Coordinate): Promise<[number, number][] | null> {
-  // 1. Define bounding box slightly larger than the two points
-  const pad = 0.02; // approx 2km padding
+// ============================================================
+// OVERPASS NETWORK CACHE
+// ============================================================
+interface GraphData {
+  nodes: Map<number, Coordinate>;
+  graph: Map<number, { to: number; weight: number }[]>;
+}
+
+const networkCache = new Map<string, GraphData>();
+
+function bboxKey(minLat: number, minLon: number, maxLat: number, maxLon: number) {
+  return `${minLat.toFixed(4)},${minLon.toFixed(4)},${maxLat.toFixed(4)},${maxLon.toFixed(4)}`;
+}
+
+async function fetchRoadNetwork(start: Coordinate, end: Coordinate): Promise<GraphData> {
+  const pad = 0.015; // ~1.5km padding — tight bbox = fast query
   const minLat = Math.min(start.lat, end.lat) - pad;
   const maxLat = Math.max(start.lat, end.lat) + pad;
   const minLon = Math.min(start.lng, end.lng) - pad;
   const maxLon = Math.max(start.lng, end.lng) + pad;
-  
+
+  const key = bboxKey(minLat, minLon, maxLat, maxLon);
+  if (networkCache.has(key)) {
+    console.log('Road network cache HIT');
+    return networkCache.get(key)!;
+  }
+
   const bbox = `${minLat},${minLon},${maxLat},${maxLon}`;
-  
-  // 2. Fetch road network from Overpass API
-  // We filter by highway tags that are drivable
-  const query = `
-    [out:json];
-    (
-      way["highway"~"motorway|trunk|primary|secondary|tertiary|unclassified|residential"](${bbox});
-    );
-    out body;
-    >;
-    out skel qt;
-  `;
-  
-  const overpassUrl = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
-  
-  console.log("Fetching Overpass Data...");
-  const res = await fetch(overpassUrl);
-  if (!res.ok) throw new Error("Overpass API failed");
+
+  // Leaner query: only major drivable roads, compact output
+  const query = `[out:json][timeout:10];way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential)$"](${bbox});out body qt;>;out skel qt;`;
+
+  console.log('Fetching road network from Overpass...');
+  const t0 = performance.now();
+  const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
+  if (!res.ok) throw new Error('Overpass API failed');
   const data = await res.json();
-  
-  // 3. Parse nodes and ways
+  console.log(`Overpass responded in ${((performance.now() - t0) / 1000).toFixed(1)}s — ${data.elements.length} elements`);
+
   const nodes = new Map<number, Coordinate>();
-  const ways: OsmWay[] = [];
-  
+  const graph = new Map<number, { to: number; weight: number }[]>();
+
+  // Parse all elements in a single pass
+  const ways: { nodes: number[]; oneway: boolean }[] = [];
   for (const el of data.elements) {
     if (el.type === 'node') {
       nodes.set(el.id, { lat: el.lat, lng: el.lon });
     } else if (el.type === 'way') {
-      ways.push({ id: el.id, nodes: el.nodes, tags: el.tags || {} });
+      ways.push({ nodes: el.nodes, oneway: el.tags?.oneway === 'yes' });
     }
   }
-  
-  // 4. Build Graph (Adjacency List)
-  const graph = new Map<number, { to: number, weight: number }[]>();
-  
-  const addEdge = (from: number, to: number, weight: number) => {
-    if (!graph.has(from)) graph.set(from, []);
-    graph.get(from)!.push({ to, weight });
-  };
-  
+
+  // Build adjacency list
   for (const way of ways) {
-    const isOneWay = way.tags['oneway'] === 'yes';
     for (let i = 0; i < way.nodes.length - 1; i++) {
-      const n1 = way.nodes[i];
-      const n2 = way.nodes[i + 1];
-      const c1 = nodes.get(n1);
-      const c2 = nodes.get(n2);
-      
-      if (c1 && c2) {
-        const dist = haversineDistance(c1, c2);
-        addEdge(n1, n2, dist);
-        if (!isOneWay) {
-          addEdge(n2, n1, dist);
-        }
+      const a = way.nodes[i], b = way.nodes[i + 1];
+      const ca = nodes.get(a), cb = nodes.get(b);
+      if (!ca || !cb) continue;
+      const d = haversineDistance(ca, cb);
+      if (!graph.has(a)) graph.set(a, []);
+      graph.get(a)!.push({ to: b, weight: d });
+      if (!way.oneway) {
+        if (!graph.has(b)) graph.set(b, []);
+        graph.get(b)!.push({ to: a, weight: d });
       }
     }
   }
-  
-  // 5. Find nearest nodes to start and end coordinates
-  let startNodeId = -1;
-  let endNodeId = -1;
-  let minStartDist = Infinity;
-  let minEndDist = Infinity;
-  
-  for (const [id, coord] of nodes.entries()) {
-    // Only consider nodes that are part of the graph (connected to a way)
+
+  const result = { nodes, graph };
+  networkCache.set(key, result);
+  return result;
+}
+
+// ============================================================
+// A* SEARCH (Dijkstra + heuristic = much faster)
+// ============================================================
+export async function computeDijkstraRoute(start: Coordinate, end: Coordinate): Promise<[number, number][] | null> {
+  const { nodes, graph } = await fetchRoadNetwork(start, end);
+
+  // Find nearest graph nodes to start/end
+  let startNode = -1, endNode = -1;
+  let minSD = Infinity, minED = Infinity;
+
+  for (const [id, coord] of nodes) {
     if (!graph.has(id)) continue;
-    
-    const dStart = haversineDistance(start, coord);
-    if (dStart < minStartDist) {
-      minStartDist = dStart;
-      startNodeId = id;
-    }
-    
-    const dEnd = haversineDistance(end, coord);
-    if (dEnd < minEndDist) {
-      minEndDist = dEnd;
-      endNodeId = id;
-    }
+    const ds = fastApproxDistance(start, coord);
+    const de = fastApproxDistance(end, coord);
+    if (ds < minSD) { minSD = ds; startNode = id; }
+    if (de < minED) { minED = de; endNode = id; }
   }
-  
-  if (startNodeId === -1 || endNodeId === -1) {
-    console.error("Could not find nearby road nodes");
+
+  if (startNode === -1 || endNode === -1) {
+    console.error('No nearby road nodes');
     return null;
   }
-  
-  // 6. Run Custom Dijkstra
-  console.log("Running Custom Dijkstra on Graph...");
-  const distances = new Map<number, number>();
-  const previous = new Map<number, number>();
-  const pq = new MinPriorityQueue();
-  
-  for (const id of graph.keys()) {
-    distances.set(id, Infinity);
-  }
-  distances.set(startNodeId, 0);
-  pq.enqueue(startNodeId, 0);
-  
-  while (!pq.isEmpty()) {
-    const current = pq.dequeue();
-    if (!current) break;
-    
-    const { id: currId, priority: currDist } = current;
-    
-    if (currId === endNodeId) break; // Found shortest path
-    if (currDist > distances.get(currId)!) continue;
-    
-    const neighbors = graph.get(currId) || [];
-    for (const neighbor of neighbors) {
-      const alt = currDist + neighbor.weight;
-      if (alt < distances.get(neighbor.to)!) {
-        distances.set(neighbor.to, alt);
-        previous.set(neighbor.to, currId);
-        pq.enqueue(neighbor.to, alt);
-      }
-    }
-  }
-  
-  // 7. Reconstruct path
-  const path: number[] = [];
-  let curr: number | undefined = endNodeId;
-  while (curr !== undefined) {
-    path.unshift(curr);
-    curr = previous.get(curr);
-    if (curr === startNodeId) {
-      path.unshift(curr);
+
+  const endCoord = nodes.get(endNode)!;
+
+  // A* with binary heap
+  console.log(`Running A* (Dijkstra + heuristic) on ${graph.size} nodes...`);
+  const t0 = performance.now();
+
+  const gScore = new Map<number, number>();
+  const prev = new Map<number, number>();
+  const pq = new BinaryMinHeap();
+  let visited = 0;
+
+  gScore.set(startNode, 0);
+  pq.push(startNode, fastApproxDistance(nodes.get(startNode)!, endCoord));
+
+  while (pq.size > 0) {
+    const curr = pq.pop()!;
+    visited++;
+
+    if (curr.id === endNode) {
+      console.log(`Path found! Visited ${visited} nodes in ${((performance.now() - t0)).toFixed(0)}ms`);
       break;
     }
+
+    const currG = gScore.get(curr.id) ?? Infinity;
+    const neighbors = graph.get(curr.id);
+    if (!neighbors) continue;
+
+    for (const edge of neighbors) {
+      const tentG = currG + edge.weight;
+      if (tentG < (gScore.get(edge.to) ?? Infinity)) {
+        gScore.set(edge.to, tentG);
+        prev.set(edge.to, curr.id);
+        const h = fastApproxDistance(nodes.get(edge.to)!, endCoord);
+        pq.push(edge.to, tentG + h);
+      }
+    }
   }
-  
-  if (path.length === 0 || path[0] !== startNodeId) {
-    console.error("No path found");
+
+  // Reconstruct path
+  if (!prev.has(endNode) && startNode !== endNode) {
+    console.error('No path found');
     return null;
   }
-  
-  // Map back to lat/lng geometry
-  const geometry: [number, number][] = path.map(id => [nodes.get(id)!.lat, nodes.get(id)!.lng]);
-  return geometry;
+
+  const path: number[] = [];
+  let c: number | undefined = endNode;
+  while (c !== undefined && c !== startNode) {
+    path.unshift(c);
+    c = prev.get(c);
+  }
+  path.unshift(startNode);
+
+  return path.map(id => {
+    const n = nodes.get(id)!;
+    return [n.lat, n.lng] as [number, number];
+  });
 }

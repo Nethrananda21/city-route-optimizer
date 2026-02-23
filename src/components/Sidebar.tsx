@@ -67,7 +67,7 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
   const [suggestions, setSuggestions] = useState<any[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const justSelected = useRef(false);
-  const debouncedValue = useDebounce(value, 150);
+  const debouncedValue = useDebounce(value, 80);
 
   useEffect(() => {
     // After a selection, the value changes but we don't want to re-fetch/re-open
@@ -91,19 +91,47 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
     }
 
     const controller = new AbortController();
+    const signal = controller.signal;
 
     const fetchSuggestions = async () => {
       try {
-        const res = await fetch(
-          `https://photon.komoot.io/api/?q=${encodeURIComponent(debouncedValue)}&limit=5`,
-          { signal: controller.signal }
+        // Race Photon AND Nominatim — whoever responds first wins
+        const timeout = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), 3000)
         );
-        const data = await res.json();
-        if (data && data.features) {
-          suggestionsCache.set(key, data.features);
-          setSuggestions(data.features);
-          setIsOpen(true);
-        }
+
+        const photonFetch = fetch(
+          `https://photon.komoot.io/api/?q=${encodeURIComponent(debouncedValue)}&limit=5`,
+          { signal }
+        ).then(r => r.json()).then(data => {
+          if (!data?.features?.length) throw new Error('empty');
+          return data.features.map((f: any) => ({
+            name: f.properties.name || '',
+            street: f.properties.street || '',
+            city: f.properties.city || '',
+            state: f.properties.state || '',
+            country: f.properties.country || '',
+          }));
+        });
+
+        const nominatimFetch = fetch(
+          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(debouncedValue)}&format=json&limit=5&addressdetails=1`,
+          { signal }
+        ).then(r => r.json()).then(data => {
+          if (!data?.length) throw new Error('empty');
+          return data.map((item: any) => ({
+            name: item.display_name?.split(',')[0] || '',
+            street: item.address?.road || '',
+            city: item.address?.city || item.address?.town || item.address?.village || '',
+            state: item.address?.state || '',
+            country: item.address?.country || '',
+          }));
+        });
+
+        const results = await Promise.any([photonFetch, nominatimFetch, timeout]) as any[];
+        suggestionsCache.set(key, results);
+        setSuggestions(results);
+        setIsOpen(true);
       } catch (e: any) {
         if (e.name !== 'AbortError') console.error(e);
       }
@@ -113,10 +141,9 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
     return () => controller.abort();
   }, [debouncedValue]);
 
-  const handleSelect = (feature: any) => {
-    const p = feature.properties;
-    const name = p.name || '';
-    const city = p.city || p.state || '';
+  const handleSelect = (s: any) => {
+    const name = s.name || '';
+    const city = s.city || s.state || '';
     const fullName = city ? `${name}, ${city}` : name;
     justSelected.current = true;
     setSuggestions([]);
@@ -156,9 +183,9 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
                   className="px-4 py-3 hover:bg-white/10 cursor-pointer text-gray-300 hover:text-white transition-colors border-b border-white/5 last:border-0"
                   onClick={() => handleSelect(s)}
                 >
-                  <div className="font-medium text-white">{s.properties.name}</div>
+                  <div className="font-medium text-white">{s.name}</div>
                   <div className="text-xs text-gray-400">
-                    {[s.properties.street, s.properties.city, s.properties.state, s.properties.country].filter(Boolean).join(', ')}
+                    {[s.street, s.city, s.state, s.country].filter(Boolean).join(', ')}
                   </div>
                 </div>
               ))}
@@ -171,8 +198,8 @@ const AddressAutocomplete: React.FC<AddressAutocompleteProps> = ({ value, onChan
 };
 
 const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated }) => {
-  const [startQuery, setStartQuery] = useState('Times Square, NY');
-  const [endQuery, setEndQuery] = useState('Central Park, NY');
+  const [startQuery, setStartQuery] = useState('');
+  const [endQuery, setEndQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [routeInfo, setRouteInfo] = useState<{distance: number, duration: number, algorithm: string} | null>(null);
 
@@ -312,7 +339,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen, setIsOpen, onRouteCalculated 
                   
                   <div className="mt-4 flex items-center justify-center gap-2">
                     <span className="px-3 py-1 rounded-full text-xs font-medium bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                      ⚡ {routeInfo.algorithm === 'dijkstra' ? "Dijkstra's Algorithm" : "Dijkstra-based CH (OSRM)"}
+                      ⚡ {routeInfo.algorithm}
                     </span>
                   </div>
 
